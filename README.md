@@ -73,7 +73,7 @@ A solução combina um script em Python de alta fidelidade rodando em segundo pl
 ## 💻 Comandos para Rodar / Commands to Run
 
 ### Pré-requisitos
-* **Driver Serial:** Instalar o driver Silicon Labs CP210x para o Windows reconhecer a porta COM (`COM5`).
+* **Driver Serial:** Instalar o driver Silicon Labs CP210x ou WCH CH9102 para o Windows reconhecer a porta COM (o script detecta dinamicamente qualquer porta USB conectada).
 * **Python 3.10+** instalado no Windows com `pip`.
 
 ---
@@ -114,8 +114,28 @@ py spotify_m5_companion.py
 ---
 
 ### Passo 5: Encerrar ou Desconectar
-Para parar o companion, aperte **`Ctrl + C`** no terminal.  
+Para parar o companion quando estiver rodando no terminal, aperte **`Ctrl + C`**.  
 O script enviará o comando de desconexão e o M5Stack limpará a tela voltando para o modo de espera automaticamente.
+
+---
+
+## ⚡ Automação e Uso no Dia a Dia (Background & Scripts)
+
+Para não precisar abrir o terminal e digitar comandos toda vez, a pasta `pc_companion/` inclui scripts prontos para automação:
+
+| Arquivo | Descrição |
+| :--- | :--- |
+| **`iniciar_companion.vbs`** | Inicia o companion em **segundo plano** (silencioso, sem janela preta de prompt). |
+| **`reiniciar_companion.bat`** | Encerra a versão antiga em execução e sobe a nova atualizada em 1 segundo (útil para refletir alterações no código sem reiniciar o PC). |
+| **`parar_companion.bat`** | Encerra com segurança apenas o processo do companion em segundo plano. |
+| **`modo_depuracao.bat`** | Encerra instâncias em background e inicia em um **prompt interativo com logs visíveis** (ideal para desenvolvimento). |
+
+### 🔄 Iniciar Automaticamente com o Windows
+1. Pressione `Win + R`, digite `shell:startup` e pressione **Enter**.
+2. Clique com o botão direito no arquivo `pc_companion/iniciar_companion.vbs` e escolha **Copiar**.
+3. Na pasta de *Inicializar*, clique com o botão direito e selecione **Colar Atalho**.
+
+> **Nota:** O script possui **auto-reconexão contínua**. Se você ligar o computador sem o M5Stack conectado ou puxar o cabo USB, ele continuará aguardando e reconectará automaticamente assim que a porta for restabelecida, em qualquer entrada USB!
 
 ---
 

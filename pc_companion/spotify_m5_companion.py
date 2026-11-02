@@ -51,11 +51,14 @@ def find_m5stack_port():
     for p in ports:
         desc = (p.description or "").lower()
         hwid = (p.hwid or "").lower()
-        if "cp210" in desc or "10c4:ea60" in hwid or "m5stack" in desc or p.device == "COM5":
+        # Identifica chips USB-Serial comuns no M5Stack/ESP32 (CP210x, CH9102, CH34x, ESP USB JTAG)
+        if any(chip in desc or chip in hwid for chip in ["cp210", "10c4:ea60", "m5stack", "ch9102", "1a86:55d4", "ch340", "1a86:7523", "303a:"]):
             return p.device
-    if len(ports) > 0:
-        return ports[0].device
-    return "COM5"
+    # Se houver alguma porta serial conectada que nao seja a COM1 fisica padrao
+    available = [p.device for p in ports if p.device.upper() != "COM1"]
+    if available:
+        return available[0]
+    return None
 
 def audio_callback(in_data, frame_count, time_info, status):
     global spectrum_data, smooth_bars, is_spotify_paused, FFT_FREQS, CHANNELS
@@ -161,14 +164,6 @@ def handle_m5_command(cmd):
 async def main():
     global FFT_FREQS, CHANNELS
     
-    target_port = find_m5stack_port()
-    print(f"[*] Connecting to M5Stack on {target_port} at {BAUD_RATE} baud...")
-    try:
-        ser = serial.Serial(target_port, BAUD_RATE, timeout=0.05)
-    except Exception as e:
-        print(f"[!] Error opening {target_port}: {e}")
-        sys.exit(1)
-
     # Localiza o dispositivo WASAPI Loopback real do Windows
     p = pyaudio.PyAudio()
     try:
@@ -193,7 +188,6 @@ async def main():
 
     print(f"[*] Loopback Device: {loopback_device['name']} (Sample Rate: {sample_rate} Hz, Channels: {CHANNELS})")
     print("[*] PURE DIGITAL WASAPI LOOPBACK ACTIVE (Microphone is 100% disabled)!")
-    print("[*] Press Ctrl+C to disconnect and stop.")
 
     stream = p.open(
         format=pyaudio.paFloat32,
@@ -205,29 +199,62 @@ async def main():
         stream_callback=audio_callback
     )
 
-    last_meta_time = 0
     try:
         stream.start_stream()
+        print("[*] Companion em execucao. Aguardando M5Stack...")
+        
         while True:
-            # 1. Envia espectro (~30 FPS)
-            fft_msg = "FFT|" + ",".join(map(str, spectrum_data)) + "\n"
-            ser.write(fft_msg.encode('utf-8'))
+            target_port = find_m5stack_port()
+            if not target_port:
+                # M5Stack nao conectado ainda, aguarda e tenta novamente
+                await asyncio.sleep(2)
+                continue
 
-            # 2. Atualiza metadados do Spotify
-            now = time.time()
-            if now - last_meta_time > 0.8:
-                title, artist, prog = await get_spotify_media()
-                meta_msg = f"META|{title}|{artist}|{prog}\n"
-                ser.write(meta_msg.encode('utf-8'))
-                last_meta_time = now
+            print(f"[*] M5Stack detectado na porta {target_port}. Conectando...")
+            try:
+                ser = serial.Serial(target_port, BAUD_RATE, timeout=0.05)
+                print(f"[+] Conectado com sucesso ao M5Stack na porta {target_port}!")
+            except Exception as e:
+                print(f"[!] Falha ao abrir {target_port}: {e}. Tentando novamente em 2s...")
+                await asyncio.sleep(2)
+                continue
 
-            # 3. Lê comandos dos botões
-            if ser.in_waiting:
-                incoming = ser.readline().decode('utf-8', errors='ignore').strip()
-                if incoming.startswith("CMD:"):
-                    handle_m5_command(incoming)
+            last_meta_time = 0
+            try:
+                while True:
+                    # 1. Envia espectro (~30 FPS)
+                    fft_msg = "FFT|" + ",".join(map(str, spectrum_data)) + "\n"
+                    ser.write(fft_msg.encode('utf-8'))
 
-            await asyncio.sleep(0.03)
+                    # 2. Atualiza metadados do Spotify
+                    now = time.time()
+                    if now - last_meta_time > 0.8:
+                        title, artist, prog = await get_spotify_media()
+                        meta_msg = f"META|{title}|{artist}|{prog}\n"
+                        ser.write(meta_msg.encode('utf-8'))
+                        last_meta_time = now
+
+                    # 3. Lê comandos dos botões
+                    if ser.in_waiting:
+                        incoming = ser.readline().decode('utf-8', errors='ignore').strip()
+                        if incoming.startswith("CMD:"):
+                            handle_m5_command(incoming)
+
+                    await asyncio.sleep(0.03)
+
+            except (serial.SerialException, OSError) as e:
+                print(f"[!] Conexao com M5Stack perdida ({e}). Aguardando reconexao...")
+            finally:
+                try:
+                    ser.write(b"DISCONNECT\n")
+                    ser.flush()
+                except Exception:
+                    pass
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
 
     except KeyboardInterrupt:
         print("\n[*] Stopping companion...")
@@ -236,11 +263,6 @@ async def main():
             stream.stop_stream()
             stream.close()
             p.terminate()
-            print("[*] Sending disconnect signal to M5Stack...")
-            ser.write(b"DISCONNECT\n")
-            ser.flush()
-            time.sleep(0.1)
-            ser.close()
         except Exception:
             pass
         print("[*] Disconnected cleanly.")
