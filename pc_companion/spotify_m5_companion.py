@@ -20,18 +20,23 @@ BAUD_RATE = 115200
 FREQ_EDGES = np.logspace(np.log10(35), np.log10(15000), NUM_BANDS + 1)
 FFT_FREQS = np.fft.rfftfreq(BLOCK_SIZE, 1.0 / SAMPLE_RATE)
 
-# Curva de ponderação de estúdio:
-# Graves (40-100 Hz) = ganho 1.0x (SEM atenuação!)
-# Médios e agudos sobem suavemente para compensar a dispersão de bins na FFT
-WEIGHTS = np.linspace(1.0, 2.2, NUM_BANDS)
+# ==============================================================================
+# CALIBRAÇÃO DE SENSIBILIDADE POR BANDA (Ajuste fino individual)
+# Você pode alterar diretamente os valores abaixo para cada frequência:
+# ==============================================================================
+# [ 40Hz,  63Hz, 100Hz, 160Hz,  250,  400,  630,   1k, 1.6k, 2.5k,   4k, 6.3k,   8k,  10k,  12k,  15k ]
+WEIGHTS = np.array([
+    1.80, 1.75, 1.65, 1.45,  # <-- GRAVES (40 a 160 Hz): BOOST de presença para bumbos e baixos
+    1.20, 1.25, 1.30, 1.35,  # <-- MÉDIOS-GRAVES (250 Hz a 1 kHz): Inalterados
+    1.45, 1.55, 1.70, 1.85,  # <-- MÉDIOS-AGUDOS (1.6 kHz a 6.3 kHz): Inalterados
+    1.95, 2.05, 2.15, 2.20   # <-- AGUDOS (8 kHz a 15 kHz): Inalterados
+])
 
 # Janela Hanning e normalização precisa
 WINDOW = np.hanning(BLOCK_SIZE)
 WINDOW_SUM = np.sum(WINDOW)
 
 # Escala em Decibéis (dBFS):
-# -40 dBFS = silêncio / base (0%)
-# -2 dBFS = pico máximo digital (100%)
 DB_FLOOR = -40.0
 DB_CEIL  = -2.0
 DB_RANGE = DB_CEIL - DB_FLOOR
@@ -61,19 +66,18 @@ def audio_callback(indata, frames, time_info, status):
 
     mono = indata[:, 0]
     
-    # 1. Energia geral para corte rápido de silêncio
+    # 1. Corte rápido de silêncio
     rms = np.sqrt(np.mean(mono ** 2))
     if rms < 0.0004 or is_spotify_paused:
         smooth_bars *= 0.65
         spectrum_data = [int(v) for v in smooth_bars]
         return
 
-    # 2. FFT com calibração de amplitude absoluta
+    # 2. FFT com amplitude absoluta
     windowed = mono * WINDOW
     fft = np.abs(np.fft.rfft(windowed)) * (2.0 / WINDOW_SUM)
 
-    # 3. Pega o pico de energia (np.max) de cada banda
-    # Usar max em vez de média é crucial para graves, pois bumbos e baixos concentram sua energia em 1 único tom!
+    # 3. Extrai pico por banda e aplica os pesos individuais
     band_values = []
     for i in range(NUM_BANDS):
         low_f = FREQ_EDGES[i]
@@ -90,13 +94,11 @@ def audio_callback(indata, frames, time_info, status):
 
     band_values = np.array(band_values)
 
-    # 4. Mapeamento direto em Decibéis (dBFS)
+    # 4. Mapeamento em Decibéis (dBFS)
     db_values = 20.0 * np.log10(np.maximum(band_values, 1e-5))
-
-    # Converte de [-40 dBFS, -2 dBFS] para [0, 100%]
     target_pct = np.clip((db_values - DB_FLOOR) / DB_RANGE * 100.0, 0.0, 100.0)
 
-    # 5. Balística profissional (Peak Programme Meter)
+    # 5. Balística profissional (PPM)
     for i in range(NUM_BANDS):
         if target_pct[i] >= smooth_bars[i]:
             smooth_bars[i] = target_pct[i]
@@ -167,7 +169,7 @@ async def main():
             break
 
     print(f"[*] Audio loopback device: {device_id if device_id is not None else 'Default'}")
-    print("[*] Studio Reference Calibration Active (-40 dB to -2 dB)!")
+    print("[*] Custom EQ active: Bass Boost applied to 40Hz, 63Hz, 100Hz, 160Hz!")
     print("[*] Press Ctrl+C to disconnect and stop.")
 
     stream = sd.InputStream(
