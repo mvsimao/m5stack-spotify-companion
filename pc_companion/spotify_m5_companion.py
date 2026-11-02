@@ -20,28 +20,25 @@ BAUD_RATE = 115200
 FREQ_EDGES = np.logspace(np.log10(35), np.log10(15000), NUM_BANDS + 1)
 FFT_FREQS = np.fft.rfftfreq(BLOCK_SIZE, 1.0 / SAMPLE_RATE)
 
-# Pré-cálculo da inclinação padrão de masterização (+3.5 dB por oitava relativa a 1 kHz)
-# Isso equilibra a distribuição física natural do ruído rosa sem inventar frequências falsas
-TILTS = []
-for i in range(NUM_BANDS):
-    center_freq = np.sqrt(FREQ_EDGES[i] * FREQ_EDGES[i + 1])
-    octaves_from_1k = np.log2(center_freq / 1000.0)
-    tilt_db = octaves_from_1k * 3.5
-    TILTS.append(10.0 ** (tilt_db / 20.0))
-TILTS = np.array(TILTS)
+# Curva de ponderação de estúdio:
+# Graves (40-100 Hz) = ganho 1.0x (SEM atenuação!)
+# Médios e agudos sobem suavemente para compensar a dispersão de bins na FFT
+WEIGHTS = np.linspace(1.0, 2.2, NUM_BANDS)
 
-# Janela Hanning e fator de normalização de energia
+# Janela Hanning e normalização precisa
 WINDOW = np.hanning(BLOCK_SIZE)
 WINDOW_SUM = np.sum(WINDOW)
 
-# Escala de Decibéis de Estúdio (dBFS)
-DB_FLOOR = -50.0  # Nível de silêncio / base (0% na barra)
-DB_CEIL  = -2.0   # Nível de pico máximo (100% na barra)
+# Escala em Decibéis (dBFS):
+# -40 dBFS = silêncio / base (0%)
+# -2 dBFS = pico máximo digital (100%)
+DB_FLOOR = -40.0
+DB_CEIL  = -2.0
 DB_RANGE = DB_CEIL - DB_FLOOR
 
 # Balística de medidor de estúdio (Ataque rápido, queda suave)
 smooth_bars = np.zeros(NUM_BANDS)
-DECAY_FACTOR = 0.84  # Coeficiente de queda natural (~200ms)
+DECAY_FACTOR = 0.82
 
 spectrum_data = [0] * NUM_BANDS
 is_spotify_paused = False
@@ -64,47 +61,42 @@ def audio_callback(indata, frames, time_info, status):
 
     mono = indata[:, 0]
     
-    # 1. Energia RMS geral para corte imediato de silêncio
+    # 1. Energia geral para corte rápido de silêncio
     rms = np.sqrt(np.mean(mono ** 2))
-    if rms < 0.0005 or is_spotify_paused:
-        smooth_bars *= 0.7  # Cai rapidamente para zero
+    if rms < 0.0004 or is_spotify_paused:
+        smooth_bars *= 0.65
         spectrum_data = [int(v) for v in smooth_bars]
         return
 
-    # 2. FFT com calibração de amplitude absoluta (0 dBFS = 1.0)
+    # 2. FFT com calibração de amplitude absoluta
     windowed = mono * WINDOW
     fft = np.abs(np.fft.rfft(windowed)) * (2.0 / WINDOW_SUM)
 
-    # 3. Cálculo de energia RMS por banda de frequência
-    band_energies = []
+    # 3. Pega o pico de energia (np.max) de cada banda
+    # Usar max em vez de média é crucial para graves, pois bumbos e baixos concentram sua energia em 1 único tom!
+    band_values = []
     for i in range(NUM_BANDS):
         low_f = FREQ_EDGES[i]
         high_f = FREQ_EDGES[i + 1]
         mask = (FFT_FREQS >= low_f) & (FFT_FREQS < high_f)
         
         if np.any(mask):
-            # RMS da energia naquela faixa
-            mag = np.sqrt(np.mean(fft[mask] ** 2))
+            raw_peak = np.max(fft[mask])
         else:
-            mag = 0.0
+            raw_peak = 0.0
             
-        # Aplica a inclinação de referência de estúdio (+3.5 dB/oitava)
-        calibrated_mag = mag * TILTS[i]
-        band_energies.append(calibrated_mag)
+        calibrated_val = raw_peak * WEIGHTS[i]
+        band_values.append(calibrated_val)
 
-    band_energies = np.array(band_energies)
+    band_values = np.array(band_values)
 
-    # 4. Conversão para escala logarítmica real de estúdio (Decibéis dBFS)
-    # Evita log(0) com piso de 1e-6 (-120 dB)
-    db_values = 20.0 * np.log10(np.maximum(band_energies, 1e-6))
+    # 4. Mapeamento direto em Decibéis (dBFS)
+    db_values = 20.0 * np.log10(np.maximum(band_values, 1e-5))
 
-    # Mapeamento linear dos decibéis para 0% a 100%
-    # [-50 dBFS = 0%] até [-2 dBFS = 100%]
+    # Converte de [-40 dBFS, -2 dBFS] para [0, 100%]
     target_pct = np.clip((db_values - DB_FLOOR) / DB_RANGE * 100.0, 0.0, 100.0)
 
-    # 5. Balística de Medidor Profissional (Peak Program Meter):
-    # - Ataque instantâneo: se o som subiu, a barra sobe no mesmo frame
-    # - Decaimento suave: se o som baixou, a barra desce com inércia física
+    # 5. Balística profissional (Peak Programme Meter)
     for i in range(NUM_BANDS):
         if target_pct[i] >= smooth_bars[i]:
             smooth_bars[i] = target_pct[i]
@@ -175,7 +167,7 @@ async def main():
             break
 
     print(f"[*] Audio loopback device: {device_id if device_id is not None else 'Default'}")
-    print("[*] Studio Reference RTA Calibration active (dBFS Scale: -50 dB to -2 dB)!")
+    print("[*] Studio Reference Calibration Active (-40 dB to -2 dB)!")
     print("[*] Press Ctrl+C to disconnect and stop.")
 
     stream = sd.InputStream(
