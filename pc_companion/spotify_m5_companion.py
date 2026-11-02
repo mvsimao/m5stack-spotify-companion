@@ -22,14 +22,14 @@ FFT_FREQS = np.fft.rfftfreq(BLOCK_SIZE, 1.0 / SAMPLE_RATE)
 
 # ==============================================================================
 # CALIBRAÇÃO DE SENSIBILIDADE POR BANDA (Ajuste fino individual)
-# Você pode alterar diretamente os valores abaixo para cada frequência:
+# 1k e 1.6k atenuados para casar perfeitamente com a densidade real da mixagem
 # ==============================================================================
 # [ 40Hz,  63Hz, 100Hz, 160Hz,  250,  400,  630,   1k, 1.6k, 2.5k,   4k, 6.3k,   8k,  10k,  12k,  15k ]
 WEIGHTS = np.array([
-    1.80, 1.75, 1.65, 1.45,  # <-- GRAVES (40 a 160 Hz): BOOST de presença para bumbos e baixos
-    1.20, 1.25, 1.30, 1.35,  # <-- MÉDIOS-GRAVES (250 Hz a 1 kHz): Inalterados
-    1.45, 1.55, 1.70, 1.85,  # <-- MÉDIOS-AGUDOS (1.6 kHz a 6.3 kHz): Inalterados
-    1.95, 2.05, 2.15, 2.20   # <-- AGUDOS (8 kHz a 15 kHz): Inalterados
+    1.80, 1.75, 1.65, 1.45,  # <-- GRAVES (40 a 160 Hz): Presença e peso no bumbo/baixo
+    1.20, 1.25, 1.25, 1.10,  # <-- MÉDIOS-GRAVES: 1k reduzido de 1.35 -> 1.10
+    1.20, 1.35, 1.55, 1.75,  # <-- MÉDIOS-AGUDOS: 1.6k reduzido de 1.45 -> 1.20, 2.5k -> 1.35
+    1.90, 2.05, 2.15, 2.20   # <-- AGUDOS: Pratos e brilho natural
 ])
 
 # Janela Hanning e normalização precisa
@@ -169,7 +169,7 @@ async def main():
             break
 
     print(f"[*] Audio loopback device: {device_id if device_id is not None else 'Default'}")
-    print("[*] Custom EQ active: Bass Boost applied to 40Hz, 63Hz, 100Hz, 160Hz!")
+    print("[*] Studio EQ Calibrated (Tamed 1kHz & 1.6kHz peak)!")
     print("[*] Press Ctrl+C to disconnect and stop.")
 
     stream = sd.InputStream(
