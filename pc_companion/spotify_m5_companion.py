@@ -13,18 +13,35 @@ from winsdk.windows.media.control import (
 
 NUM_BANDS = 16
 SAMPLE_RATE = 44100
-# Aumentamos BLOCK_SIZE para 2048 para dobrar a resolução espectral nos graves (resolvendo 63 Hz)
 BLOCK_SIZE = 2048
 BAUD_RATE = 115200
 
-# Noise Gate: limiar de silêncio
-NOISE_GATE = 0.001
-
+# Faixas de frequência logarítmicas de 35 Hz a 15.000 Hz
 FREQ_EDGES = np.logspace(np.log10(35), np.log10(15000), NUM_BANDS + 1)
 FFT_FREQS = np.fft.rfftfreq(BLOCK_SIZE, 1.0 / SAMPLE_RATE)
 
-band_peaks = np.ones(NUM_BANDS) * 0.02
-decay_rate = 0.985
+# Pré-cálculo da inclinação padrão de masterização (+3.5 dB por oitava relativa a 1 kHz)
+# Isso equilibra a distribuição física natural do ruído rosa sem inventar frequências falsas
+TILTS = []
+for i in range(NUM_BANDS):
+    center_freq = np.sqrt(FREQ_EDGES[i] * FREQ_EDGES[i + 1])
+    octaves_from_1k = np.log2(center_freq / 1000.0)
+    tilt_db = octaves_from_1k * 3.5
+    TILTS.append(10.0 ** (tilt_db / 20.0))
+TILTS = np.array(TILTS)
+
+# Janela Hanning e fator de normalização de energia
+WINDOW = np.hanning(BLOCK_SIZE)
+WINDOW_SUM = np.sum(WINDOW)
+
+# Escala de Decibéis de Estúdio (dBFS)
+DB_FLOOR = -50.0  # Nível de silêncio / base (0% na barra)
+DB_CEIL  = -2.0   # Nível de pico máximo (100% na barra)
+DB_RANGE = DB_CEIL - DB_FLOOR
+
+# Balística de medidor de estúdio (Ataque rápido, queda suave)
+smooth_bars = np.zeros(NUM_BANDS)
+DECAY_FACTOR = 0.84  # Coeficiente de queda natural (~200ms)
 
 spectrum_data = [0] * NUM_BANDS
 is_spotify_paused = False
@@ -41,47 +58,60 @@ def find_m5stack_port():
     return "COM5"
 
 def audio_callback(indata, frames, time_info, status):
-    global spectrum_data, band_peaks, is_spotify_paused
+    global spectrum_data, smooth_bars, is_spotify_paused
     if status:
         return
 
     mono = indata[:, 0]
     
-    # 1. Energia real do áudio (RMS)
+    # 1. Energia RMS geral para corte imediato de silêncio
     rms = np.sqrt(np.mean(mono ** 2))
-
-    # 2. Se a música estiver pausada ou volume for silêncio absoluto
-    if rms < NOISE_GATE or is_spotify_paused:
-        spectrum_data = [0] * NUM_BANDS
+    if rms < 0.0005 or is_spotify_paused:
+        smooth_bars *= 0.7  # Cai rapidamente para zero
+        spectrum_data = [int(v) for v in smooth_bars]
         return
 
-    windowed = mono * np.hanning(len(mono))
-    fft = np.abs(np.fft.rfft(windowed)) / len(mono)
+    # 2. FFT com calibração de amplitude absoluta (0 dBFS = 1.0)
+    windowed = mono * WINDOW
+    fft = np.abs(np.fft.rfft(windowed)) * (2.0 / WINDOW_SUM)
 
-    bands = []
+    # 3. Cálculo de energia RMS por banda de frequência
+    band_energies = []
     for i in range(NUM_BANDS):
         low_f = FREQ_EDGES[i]
         high_f = FREQ_EDGES[i + 1]
         mask = (FFT_FREQS >= low_f) & (FFT_FREQS < high_f)
         
         if np.any(mask):
-            raw_val = np.mean(fft[mask])
+            # RMS da energia naquela faixa
+            mag = np.sqrt(np.mean(fft[mask] ** 2))
         else:
-            raw_val = 0.0
+            mag = 0.0
+            
+        # Aplica a inclinação de referência de estúdio (+3.5 dB/oitava)
+        calibrated_mag = mag * TILTS[i]
+        band_energies.append(calibrated_mag)
 
-        # Compensação espectral progressiva
-        spectral_tilt = (i + 1) ** 0.65
-        val = raw_val * spectral_tilt
+    band_energies = np.array(band_energies)
 
-        # AGC dinâmico
-        band_peaks[i] = max(band_peaks[i] * decay_rate, val, 0.005)
-        ratio = val / band_peaks[i]
+    # 4. Conversão para escala logarítmica real de estúdio (Decibéis dBFS)
+    # Evita log(0) com piso de 1e-6 (-120 dB)
+    db_values = 20.0 * np.log10(np.maximum(band_energies, 1e-6))
 
-        dynamic_val = (ratio ** 1.45) * 100.0
-        norm = int(np.clip(dynamic_val, 0, 100))
-        bands.append(norm)
+    # Mapeamento linear dos decibéis para 0% a 100%
+    # [-50 dBFS = 0%] até [-2 dBFS = 100%]
+    target_pct = np.clip((db_values - DB_FLOOR) / DB_RANGE * 100.0, 0.0, 100.0)
 
-    spectrum_data = bands
+    # 5. Balística de Medidor Profissional (Peak Program Meter):
+    # - Ataque instantâneo: se o som subiu, a barra sobe no mesmo frame
+    # - Decaimento suave: se o som baixou, a barra desce com inércia física
+    for i in range(NUM_BANDS):
+        if target_pct[i] >= smooth_bars[i]:
+            smooth_bars[i] = target_pct[i]
+        else:
+            smooth_bars[i] = smooth_bars[i] * DECAY_FACTOR + target_pct[i] * (1.0 - DECAY_FACTOR)
+
+    spectrum_data = [int(v) for v in smooth_bars]
 
 async def get_spotify_media():
     global is_spotify_paused
@@ -145,7 +175,7 @@ async def main():
             break
 
     print(f"[*] Audio loopback device: {device_id if device_id is not None else 'Default'}")
-    print("[*] High-Resolution 2048 FFT loaded (63 Hz resolved)!")
+    print("[*] Studio Reference RTA Calibration active (dBFS Scale: -50 dB to -2 dB)!")
     print("[*] Press Ctrl+C to disconnect and stop.")
 
     stream = sd.InputStream(
