@@ -1,6 +1,6 @@
 import asyncio
 import numpy as np
-import sounddevice as sd
+import pyaudiowpatch as pyaudio
 import serial
 import serial.tools.list_ports
 import pyautogui
@@ -12,27 +12,22 @@ from winsdk.windows.media.control import (
 )
 
 NUM_BANDS = 16
-SAMPLE_RATE = 44100
 BLOCK_SIZE = 2048
 BAUD_RATE = 115200
 
 # Faixas de frequência logarítmicas de 35 Hz a 15.000 Hz
 FREQ_EDGES = np.logspace(np.log10(35), np.log10(15000), NUM_BANDS + 1)
-FFT_FREQS = np.fft.rfftfreq(BLOCK_SIZE, 1.0 / SAMPLE_RATE)
 
-# ==============================================================================
-# CALIBRAÇÃO DE SENSIBILIDADE POR BANDA (Ajuste fino individual)
-# 1k e 1.6k atenuados para casar perfeitamente com a densidade real da mixagem
-# ==============================================================================
+# Calibração fina de estúdio por frequência
 # [ 40Hz,  63Hz, 100Hz, 160Hz,  250,  400,  630,   1k, 1.6k, 2.5k,   4k, 6.3k,   8k,  10k,  12k,  15k ]
 WEIGHTS = np.array([
-    1.80, 1.75, 1.65, 1.45,  # <-- GRAVES (40 a 160 Hz): Presença e peso no bumbo/baixo
-    1.20, 1.25, 1.25, 1.10,  # <-- MÉDIOS-GRAVES: 1k reduzido de 1.35 -> 1.10
-    1.20, 1.35, 1.55, 1.75,  # <-- MÉDIOS-AGUDOS: 1.6k reduzido de 1.45 -> 1.20, 2.5k -> 1.35
-    1.90, 2.05, 2.15, 2.20   # <-- AGUDOS: Pratos e brilho natural
+    1.80, 1.75, 1.65, 1.45,  # Graves: Punch no bumbo e contrabaixo
+    1.20, 1.25, 1.25, 1.10,  # Médios-Graves
+    1.20, 1.35, 1.55, 1.75,  # Médios-Agudos
+    1.90, 2.05, 2.15, 2.20   # Agudos
 ])
 
-# Janela Hanning e normalização precisa
+# Janela Hanning e normalização
 WINDOW = np.hanning(BLOCK_SIZE)
 WINDOW_SUM = np.sum(WINDOW)
 
@@ -41,12 +36,15 @@ DB_FLOOR = -40.0
 DB_CEIL  = -2.0
 DB_RANGE = DB_CEIL - DB_FLOOR
 
-# Balística de medidor de estúdio (Ataque rápido, queda suave)
+# Balística de medidor de estúdio (PPM)
 smooth_bars = np.zeros(NUM_BANDS)
 DECAY_FACTOR = 0.82
 
 spectrum_data = [0] * NUM_BANDS
 is_spotify_paused = False
+
+FFT_FREQS = None
+CHANNELS = 2
 
 def find_m5stack_port():
     ports = serial.tools.list_ports.comports()
@@ -59,25 +57,33 @@ def find_m5stack_port():
         return ports[0].device
     return "COM5"
 
-def audio_callback(indata, frames, time_info, status):
-    global spectrum_data, smooth_bars, is_spotify_paused
-    if status:
-        return
-
-    mono = indata[:, 0]
+def audio_callback(in_data, frame_count, time_info, status):
+    global spectrum_data, smooth_bars, is_spotify_paused, FFT_FREQS, CHANNELS
     
+    audio = np.frombuffer(in_data, dtype=np.float32)
+    if CHANNELS > 1:
+        mono = audio[0::CHANNELS]
+    else:
+        mono = audio
+
+    # Garante tamanho exato do bloco para a FFT
+    if len(mono) < BLOCK_SIZE:
+        mono = np.pad(mono, (0, BLOCK_SIZE - len(mono)))
+    else:
+        mono = mono[:BLOCK_SIZE]
+
     # 1. Corte rápido de silêncio
     rms = np.sqrt(np.mean(mono ** 2))
     if rms < 0.0004 or is_spotify_paused:
         smooth_bars *= 0.65
         spectrum_data = [int(v) for v in smooth_bars]
-        return
+        return (None, pyaudio.paContinue)
 
     # 2. FFT com amplitude absoluta
     windowed = mono * WINDOW
     fft = np.abs(np.fft.rfft(windowed)) * (2.0 / WINDOW_SUM)
 
-    # 3. Extrai pico por banda e aplica os pesos individuais
+    # 3. Extrai pico por banda
     band_values = []
     for i in range(NUM_BANDS):
         low_f = FREQ_EDGES[i]
@@ -106,6 +112,7 @@ def audio_callback(indata, frames, time_info, status):
             smooth_bars[i] = smooth_bars[i] * DECAY_FACTOR + target_pct[i] * (1.0 - DECAY_FACTOR)
 
     spectrum_data = [int(v) for v in smooth_bars]
+    return (None, pyaudio.paContinue)
 
 async def get_spotify_media():
     global is_spotify_paused
@@ -152,6 +159,8 @@ def handle_m5_command(cmd):
         pyautogui.press('prevtrack')
 
 async def main():
+    global FFT_FREQS, CHANNELS
+    
     target_port = find_m5stack_port()
     print(f"[*] Connecting to M5Stack on {target_port} at {BAUD_RATE} baud...")
     try:
@@ -160,54 +169,73 @@ async def main():
         print(f"[!] Error opening {target_port}: {e}")
         sys.exit(1)
 
-    device_id = None
-    devices = sd.query_devices()
-    for idx, d in enumerate(devices):
-        name = d['name'].lower()
-        if d['max_input_channels'] > 0 and ('loopback' in name or '[loopback]' in name):
-            device_id = idx
-            break
+    # Localiza o dispositivo WASAPI Loopback real do Windows
+    p = pyaudio.PyAudio()
+    try:
+        wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+    except OSError:
+        print("[!] WASAPI is not available on this Windows system.")
+        sys.exit(1)
 
-    print(f"[*] Audio loopback device: {device_id if device_id is not None else 'Default'}")
-    print("[*] Studio EQ Calibrated (Tamed 1kHz & 1.6kHz peak)!")
+    default_speakers = p.get_device_info_by_index(wasapi_info['defaultOutputDevice'])
+    loopback_device = None
+    for d in p.get_loopback_device_info_generator():
+        if default_speakers['name'] in d['name']:
+            loopback_device = d
+            break
+            
+    if not loopback_device:
+        loopback_device = next(p.get_loopback_device_info_generator())
+
+    sample_rate = int(loopback_device['defaultSampleRate'])
+    CHANNELS = loopback_device['maxInputChannels']
+    FFT_FREQS = np.fft.rfftfreq(BLOCK_SIZE, 1.0 / sample_rate)
+
+    print(f"[*] Loopback Device: {loopback_device['name']} (Sample Rate: {sample_rate} Hz, Channels: {CHANNELS})")
+    print("[*] PURE DIGITAL WASAPI LOOPBACK ACTIVE (Microphone is 100% disabled)!")
     print("[*] Press Ctrl+C to disconnect and stop.")
 
-    stream = sd.InputStream(
-        device=device_id,
-        channels=2,
-        samplerate=SAMPLE_RATE,
-        blocksize=BLOCK_SIZE,
-        callback=audio_callback
+    stream = p.open(
+        format=pyaudio.paFloat32,
+        channels=CHANNELS,
+        rate=sample_rate,
+        input=True,
+        input_device_index=loopback_device['index'],
+        frames_per_buffer=BLOCK_SIZE,
+        stream_callback=audio_callback
     )
 
     last_meta_time = 0
     try:
-        with stream:
-            while True:
-                # 1. Envia espectro (~30 FPS)
-                fft_msg = "FFT|" + ",".join(map(str, spectrum_data)) + "\n"
-                ser.write(fft_msg.encode('utf-8'))
+        stream.start_stream()
+        while True:
+            # 1. Envia espectro (~30 FPS)
+            fft_msg = "FFT|" + ",".join(map(str, spectrum_data)) + "\n"
+            ser.write(fft_msg.encode('utf-8'))
 
-                # 2. Atualiza metadados do Spotify
-                now = time.time()
-                if now - last_meta_time > 0.8:
-                    title, artist, prog = await get_spotify_media()
-                    meta_msg = f"META|{title}|{artist}|{prog}\n"
-                    ser.write(meta_msg.encode('utf-8'))
-                    last_meta_time = now
+            # 2. Atualiza metadados do Spotify
+            now = time.time()
+            if now - last_meta_time > 0.8:
+                title, artist, prog = await get_spotify_media()
+                meta_msg = f"META|{title}|{artist}|{prog}\n"
+                ser.write(meta_msg.encode('utf-8'))
+                last_meta_time = now
 
-                # 3. Lê comandos dos botões
-                if ser.in_waiting:
-                    incoming = ser.readline().decode('utf-8', errors='ignore').strip()
-                    if incoming.startswith("CMD:"):
-                        handle_m5_command(incoming)
+            # 3. Lê comandos dos botões
+            if ser.in_waiting:
+                incoming = ser.readline().decode('utf-8', errors='ignore').strip()
+                if incoming.startswith("CMD:"):
+                    handle_m5_command(incoming)
 
-                await asyncio.sleep(0.03)
+            await asyncio.sleep(0.03)
 
     except KeyboardInterrupt:
         print("\n[*] Stopping companion...")
     finally:
         try:
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
             print("[*] Sending disconnect signal to M5Stack...")
             ser.write(b"DISCONNECT\n")
             ser.flush()

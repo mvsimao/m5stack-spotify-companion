@@ -1,4 +1,4 @@
-sounddevice
+PyAudioWPatch
 numpy
 pyserial
 winsdk
