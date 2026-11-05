@@ -41,7 +41,8 @@ smooth_bars = np.zeros(NUM_BANDS)
 DECAY_FACTOR = 0.82
 
 spectrum_data = [0] * NUM_BANDS
-is_spotify_paused = False
+last_audio_time = 0
+is_media_playing = False
 
 FFT_FREQS = None
 CHANNELS = 2
@@ -61,7 +62,7 @@ def find_m5stack_port():
     return None
 
 def audio_callback(in_data, frame_count, time_info, status):
-    global spectrum_data, smooth_bars, is_spotify_paused, FFT_FREQS, CHANNELS
+    global spectrum_data, smooth_bars, last_audio_time, FFT_FREQS, CHANNELS
     
     audio = np.frombuffer(in_data, dtype=np.float32)
     if CHANNELS > 1:
@@ -75,9 +76,11 @@ def audio_callback(in_data, frame_count, time_info, status):
     else:
         mono = mono[:BLOCK_SIZE]
 
-    # 1. Corte rápido de silêncio
+    # 1. Corte de silêncio e medição de energia real (RMS)
     rms = np.sqrt(np.mean(mono ** 2))
-    if rms < 0.0004 or is_spotify_paused:
+    if rms > 0.0004:
+        last_audio_time = time.time()
+    else:
         smooth_bars *= 0.65
         spectrum_data = [int(v) for v in smooth_bars]
         return (None, pyaudio.paContinue)
@@ -117,41 +120,63 @@ def audio_callback(in_data, frame_count, time_info, status):
     spectrum_data = [int(v) for v in smooth_bars]
     return (None, pyaudio.paContinue)
 
-async def get_spotify_media():
-    global is_spotify_paused
+async def get_media_info():
+    global is_media_playing
     try:
         sessions = await MediaManager.request_async()
         current = sessions.get_current_session()
         
-        if not current or "spotify" not in (current.source_app_user_model_id or "").lower():
-            for s in sessions.get_sessions():
+        # Procura qualquer sessão de mídia ativa (priorizando Spotify ou navegadores/YouTube)
+        all_sessions = sessions.get_sessions()
+        playing_session = None
+        for s in all_sessions:
+            info = s.get_playback_info()
+            if info and info.playback_status == PlaybackStatus.PLAYING:
+                playing_session = s
                 if "spotify" in (s.source_app_user_model_id or "").lower():
-                    current = s
                     break
 
-        if current:
-            playback_info = current.get_playback_info()
-            if playback_info:
-                is_spotify_paused = (playback_info.playback_status != PlaybackStatus.PLAYING)
+        active = playing_session or current
+        if not active and all_sessions:
+            active = all_sessions[0]
 
-            props = await current.try_get_media_properties_async()
-            timeline = current.get_timeline_properties()
+        if active:
+            playback_info = active.get_playback_info()
+            is_media_playing = (playback_info.playback_status == PlaybackStatus.PLAYING) if playback_info else False
             
-            title = props.title if props.title else "Unknown Track"
-            artist = props.artist if props.artist else "Unknown Artist"
+            props = await active.try_get_media_properties_async()
+            timeline = active.get_timeline_properties()
             
-            if is_spotify_paused:
+            raw_title = props.title if (props and props.title) else ""
+            raw_artist = props.artist if (props and props.artist) else ""
+            app_id = (active.source_app_user_model_id or "").lower()
+
+            if not raw_artist:
+                if "spotify" in app_id:
+                    raw_artist = "Spotify"
+                elif any(b in app_id for b in ["chrome", "msedge", "edge", "firefox", "brave"]):
+                    raw_artist = "YouTube / Web"
+                else:
+                    raw_artist = "PC Audio"
+
+            # Sanitiza o delimitador '|' para não corromper o enquadramento do protocolo serial
+            title = raw_title.replace('|', '-')
+            artist = raw_artist.replace('|', '-')
+
+            if not is_media_playing and artist:
                 artist = "[PAUSED] " + artist
 
             progress = 0
             if timeline and timeline.end_time.total_seconds() > 0:
                 progress = int((timeline.position.total_seconds() / timeline.end_time.total_seconds()) * 100)
-                
-            return title, artist, progress
+
+            if title:
+                return title, artist, progress, is_media_playing
     except Exception:
         pass
-    is_spotify_paused = True
-    return "Spotify Paused", "Press Play on PC", 0
+
+    is_media_playing = False
+    return None, None, 0, False
 
 def handle_m5_command(cmd):
     if cmd == "CMD:PLAYPAUSE":
@@ -220,27 +245,61 @@ async def main():
                 continue
 
             last_meta_time = 0
+            is_standby = False
+            last_sent_title = ""
+            last_sent_artist = ""
+            last_sent_prog = -1
+
             try:
                 while True:
-                    # 1. Envia espectro (~30 FPS)
-                    fft_msg = "FFT|" + ",".join(map(str, spectrum_data)) + "\n"
-                    ser.write(fft_msg.encode('utf-8'))
-
-                    # 2. Atualiza metadados do Spotify
                     now = time.time()
+                    has_audio = (now - last_audio_time < 3.0)
+
+                    # 1. Atualiza metadados da mídia periodicamente (~0.8s)
                     if now - last_meta_time > 0.8:
-                        title, artist, prog = await get_spotify_media()
-                        meta_msg = f"META|{title}|{artist}|{prog}\n"
-                        ser.write(meta_msg.encode('utf-8'))
+                        meta_title, meta_artist, meta_prog, is_playing = await get_media_info()
                         last_meta_time = now
 
-                    # 3. Lê comandos dos botões
+                    # Determina se há som tocando no PC ou mídia em execução
+                    should_be_active = has_audio or is_media_playing
+
+                    if should_be_active:
+                        if is_standby:
+                            is_standby = False
+
+                        title = meta_title or "PC Audio Visualizer"
+                        artist = meta_artist or "Pioneer DJ Mode"
+                        prog = meta_prog
+
+                        # Envia metadados se mudaram ou em intervalo regular
+                        if title != last_sent_title or artist != last_sent_artist or abs(prog - last_sent_prog) >= 1 or (now - last_meta_time > 0.75):
+                            meta_msg = f"META|{title}|{artist}|{prog}\n"
+                            ser.write(meta_msg.encode('utf-8'))
+                            last_sent_title = title
+                            last_sent_artist = artist
+                            last_sent_prog = prog
+
+                        # Envia espectro (~30 FPS)
+                        fft_msg = "FFT|" + ",".join(map(str, spectrum_data)) + "\n"
+                        ser.write(fft_msg.encode('utf-8'))
+
+                    else:
+                        # Entra em tela de espera caso não haja som nem mídia ativa
+                        if not is_standby:
+                            is_standby = True
+                            ser.write(b"DISCONNECT\n")
+                            ser.flush()
+                            last_sent_title = ""
+                            last_sent_artist = ""
+                            last_sent_prog = -1
+
+                    # 2. Lê comandos dos botões frontais do M5Stack
                     if ser.in_waiting:
                         incoming = ser.readline().decode('utf-8', errors='ignore').strip()
                         if incoming.startswith("CMD:"):
                             handle_m5_command(incoming)
 
-                    await asyncio.sleep(0.03)
+                    await asyncio.sleep(0.03 if should_be_active else 0.1)
 
             except (serial.SerialException, OSError) as e:
                 print(f"[!] Conexao com M5Stack perdida ({e}). Aguardando reconexao...")
@@ -272,4 +331,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-EOF

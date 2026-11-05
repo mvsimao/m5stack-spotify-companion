@@ -60,7 +60,7 @@ void showWaitingScreen() {
   M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
   M5.Display.drawString("Spotify Desk Companion", 160, 40, 4);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.drawString("Waiting for PC connection...", 160, 90, 2);
+  M5.Display.drawString("Waiting for audio...", 160, 90, 2);
   M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
   M5.Display.drawString("Pioneer DJ VU Meter Mode", 160, 125, 2);
 }
