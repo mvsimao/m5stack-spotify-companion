@@ -122,6 +122,8 @@ def audio_callback(in_data, frame_count, time_info, status):
 
 async def get_media_info():
     global is_media_playing
+    is_spotify_open = False
+    is_spotify_paused = False
     try:
         sessions = await MediaManager.request_async()
         current = sessions.get_current_session()
@@ -129,14 +131,23 @@ async def get_media_info():
         # Procura qualquer sessão de mídia ativa (priorizando Spotify ou navegadores/YouTube)
         all_sessions = sessions.get_sessions()
         playing_session = None
+        spotify_session = None
+
         for s in all_sessions:
+            app_id = (s.source_app_user_model_id or "").lower()
+            if "spotify" in app_id:
+                spotify_session = s
+                is_spotify_open = True
+                s_info = s.get_playback_info()
+                if s_info and s_info.playback_status != PlaybackStatus.PLAYING:
+                    is_spotify_paused = True
+
             info = s.get_playback_info()
             if info and info.playback_status == PlaybackStatus.PLAYING:
-                playing_session = s
-                if "spotify" in (s.source_app_user_model_id or "").lower():
-                    break
+                if not playing_session or "spotify" in app_id:
+                    playing_session = s
 
-        active = playing_session or current
+        active = playing_session or current or spotify_session
         if not active and all_sessions:
             active = all_sessions[0]
 
@@ -171,12 +182,12 @@ async def get_media_info():
                 progress = int((timeline.position.total_seconds() / timeline.end_time.total_seconds()) * 100)
 
             if title:
-                return title, artist, progress, is_media_playing
+                return title, artist, progress, is_media_playing, is_spotify_open, is_spotify_paused
     except Exception:
         pass
 
     is_media_playing = False
-    return None, None, 0, False
+    return None, None, 0, False, is_spotify_open, is_spotify_paused
 
 def handle_m5_command(cmd):
     if cmd == "CMD:PLAYPAUSE":
@@ -249,15 +260,19 @@ async def main():
             last_sent_title = ""
             last_sent_artist = ""
             last_sent_prog = -1
+            is_spotify_open = False
+            is_spotify_paused = False
 
             try:
                 while True:
                     now = time.time()
-                    has_audio = (now - last_audio_time < 3.0)
+                    # Se Spotify estiver aberto e pausado, espera 60 segundos antes de entrar em standby
+                    standby_delay = 60.0 if (is_spotify_open and is_spotify_paused) else 3.0
+                    has_audio = (now - last_audio_time < standby_delay)
 
                     # 1. Atualiza metadados da mídia periodicamente (~0.8s)
                     if now - last_meta_time > 0.8:
-                        meta_title, meta_artist, meta_prog, is_playing = await get_media_info()
+                        meta_title, meta_artist, meta_prog, is_playing, is_spotify_open, is_spotify_paused = await get_media_info()
                         last_meta_time = now
 
                     # Determina se há som tocando no PC ou mídia em execução
@@ -267,8 +282,12 @@ async def main():
                         if is_standby:
                             is_standby = False
 
-                        title = meta_title or "PC Audio Visualizer"
-                        artist = meta_artist or "Pioneer DJ Mode"
+                        if is_spotify_open and is_spotify_paused and not meta_title:
+                            title = "Spotify Paused"
+                            artist = "Press Play on PC"
+                        else:
+                            title = meta_title or "PC Audio Visualizer"
+                            artist = meta_artist or "Pioneer DJ Mode"
                         prog = meta_prog
 
                         # Envia metadados se mudaram ou em intervalo regular
